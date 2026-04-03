@@ -1,0 +1,9 @@
+## Interface: 30300
+## Title: Ebonhold Echo Buddy
+## Notes: Recommends and automatically selects the best echoes for your class and role
+## Author: Ebonhold
+## Version: 2.0
+## Dependencies: ProjectEbonhold
+## SavedVariables: EchoBuddyDB EchoBuddyLearnDB
+
+EbonholdEchoBuddy.lua

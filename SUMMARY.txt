@@ -1,0 +1,338 @@
+================================================================================
+  EBONHOLD ECHO BUDDY  -  How It Works & Why
+  Version 3.0  |  Author: Véronica
+================================================================================
+
+OVERVIEW
+--------
+Echo Buddy is a WoW addon built for the Project Ebonhold roguelite server. It
+does three things:
+
+  1. BUILD ADVISOR   - Browse every echo available to your class and role,
+                       ranked from best to worst before you ever start a run.
+
+  2. AUTO-SELECT     - Hooks directly into the server's echo-offer system so
+                       that whenever you level up and echoes are presented, the
+                       addon automatically clicks the highest-scoring one for
+                       you, with a brief on-screen notification showing what
+                       was chosen and why.
+
+  3. AI LEARNING     - Watches every pick you make and every run you complete.
+                       Over time it builds a per-role performance model that
+                       continuously improves its recommendations the more you
+                       play.
+
+All three features share the same role configuration, the same scoring maths,
+and the same saved database, so the AI's learnings always feed back into both
+the advisor and the auto-selector.
+
+
+HOW THE GAME DATA IS READ
+--------------------------
+Project Ebonhold ships a Blizzard-style addon called "ProjectEbonhold" inside
+the game's custom patch file (patch-4.MPQ). That addon loads the full echo
+database at login as a Lua global table:
+
+    ProjectEbonhold.PerkDatabase[spellId] = {
+        maxStack    -- how many times you can stack this echo
+        classMask   -- bitmask of which classes can receive it
+        minLevel    -- earliest level it can appear
+        quality     -- 0=Common  1=Uncommon  2=Rare  3=Epic
+        groupId     -- echoes sharing a groupId are variants of the same echo
+                       (e.g. Common, Rare, and Epic versions of "Iron Fist")
+        families    -- list of role tags: "Tank", "Healer", "Melee DPS",
+                       "Ranged DPS", "Caster DPS", "Survivability"
+    }
+
+Echo Buddy reads this table at runtime. It never ships a copy of the data
+itself, so it automatically stays up to date whenever the server patches in
+new or changed echoes.
+
+The server also exposes two functions that Echo Buddy hooks:
+
+    ProjectEbonhold.PerkUI.Show(choices)
+        Called every time the server sends you a set of echo choices to pick
+        from. choices is a list of {spellId, quality} pairs.
+
+    ProjectEbonhold.PerkService.SelectPerk(spellId)
+        Sends the player's echo selection back to the server.
+
+
+STATIC SCORING  (the baseline before any AI data exists)
+---------------------------------------------------------
+Every echo starts with a base score derived from two factors:
+
+  Quality score:
+    Common     = 10 pts
+    Uncommon   = 20 pts
+    Rare       = 30 pts
+    Epic       = 40 pts
+
+  Family bonus (applied per matching tag in the echo's families list):
+    Primary family match  (e.g. "Tank" for a Tank player)   = +40 pts
+    Secondary match       (Survivability for any role)       = varies per role:
+        Tank     +20   (survivability is almost as important as tanking)
+        Healer   +15
+        DPS      +5
+
+  A perfect Epic echo that belongs to your primary role family = 80 pts.
+  A Common echo with no relevant families = 10 pts.
+
+Deduplication: echoes that share a groupId are variants of the same underlying
+echo at different qualities. When building the full advisor list, only the
+highest-quality variant of each group is kept, so you never see duplicates.
+
+Class filtering: before scoring, every echo is filtered by the classMask
+bitmask using bitwise AND, so only echoes your class can actually receive
+are included.
+
+
+THE AI LEARNING ENGINE
+-----------------------
+The static scorer above is good but it cannot know which echoes are actually
+strong in practice versus those that just look good on paper. The learning
+engine fixes this by observing real gameplay and updating each echo's score
+over time.
+
+Data is stored in the SavedVariable "EchoBuddyLearnDB", structured as:
+
+    EchoBuddyLearnDB[role][spellId] = {
+        elo         -- current ELO rating (starts at 1200)
+        comparisons -- total number of head-to-head matchups recorded
+        wins        -- times this echo was chosen when offered
+        losses      -- times this echo was passed over when another was chosen
+        runCount    -- number of runs tracked that included this echo
+        runLevelAvg -- exponential moving average of the level reached
+                       when this echo was in the active build
+        lastSeen    -- timestamp (GetTime()) of the last time it was offered
+    }
+
+There are three learning signals:
+
+
+  SIGNAL 1: ELO COMPARATIVE LEARNING  (fires every time you pick an echo)
+  -------------------------------------------------------------------------
+  ELO is a rating system invented for chess where two players have ratings
+  and the winner's rating goes up while the loser's goes down, with the size
+  of the change depending on how surprising the result was.
+
+  Echo Buddy adapts this for echo selection. When the server offers you three
+  echoes (A, B, C) and you pick A:
+
+    - A beat B  →  A's ELO goes up, B's goes down
+    - A beat C  →  A's ELO goes up, C's goes down
+
+  The amount of change per match is controlled by the K-factor:
+    - First 10 comparisons:  K = 32  (large, fast adjustments while learning)
+    - After 10 comparisons:  K = 16  (smaller, stable adjustments once settled)
+
+  This mirrors how chess handles provisional vs. established players.
+
+  Why ELO?  Because it captures relative performance. If Rare echo X always
+  gets chosen over Epic echo Y whenever both are offered, the AI will learn
+  that X is genuinely better for that role regardless of what the static
+  quality scorer thinks.
+
+  Winner delta is averaged across all opponents in a 3-way matchup to prevent
+  rating inflation (a win against 2 opponents shouldn't count double).
+
+
+  SIGNAL 2: RUN EMA  (fires when you die)
+  ----------------------------------------
+  ELO tells us which echoes players prefer, but not which ones actually lead
+  to good runs. Run EMA fixes that.
+
+  When PLAYER_DEAD fires, Echo Buddy looks at the level you reached and
+  applies it to every echo in your current run's build:
+
+    new_avg = (0.7 * old_avg) + (0.3 * level_reached)
+
+  This is an Exponential Moving Average with alpha = 0.30. The 0.3 weight
+  on new data means recent runs matter more than old ones, so the model
+  naturally adapts as your skill improves or as server balance changes.
+
+  Why track the level reached rather than just win/lose?  Because dying at
+  level 72 with a particular echo is very different from dying at level 10.
+  A continuous signal gives the model far more information than binary.
+
+
+  SIGNAL 3: UCB1 EXPLORATION BONUS  (applied continuously)
+  ----------------------------------------------------------
+  A purely exploitative model would quickly lock onto the echoes it has seen
+  the most, permanently ignoring rare or unusual ones that might actually be
+  very good. UCB1 (Upper Confidence Bound) prevents this.
+
+  Each echo gets a small bonus inversely proportional to how often it has
+  been seen:
+
+    exploration_bonus = 8 * sqrt( ln(total_comparisons) / comparisons_for_this_echo )
+
+  This bonus is large when an echo has rarely been offered and shrinks toward
+  zero as data accumulates. The result is that the model still "tries out"
+  uncommon echoes rather than permanently underrating them.
+
+
+CONFIDENCE BLENDING  (how static and AI scores combine)
+--------------------------------------------------------
+When there is very little data, the AI scores would be unreliable noise.
+Echo Buddy therefore blends static and AI scores based on confidence:
+
+    confidence = min(1.0,  comparisons / 30)
+
+    final_score = static_score + (elo_adjustment + run_adjustment) * confidence
+                                + ucb1_bonus * (1 - confidence)
+
+  At 0 comparisons:   100% static scoring.
+  At 15 comparisons:  50% static / 50% learned.
+  At 30+ comparisons: fully learned, maximum AI influence.
+
+The AI adjustments are bounded to prevent runaway values:
+    ELO adjustment: capped at ±25 pts   (ELO 800 = -25,  1200 = 0,  1600 = +25)
+    Run adjustment: capped at ±15 pts   (avg level 0 = -15, level 80 = +15)
+
+So the maximum AI boost above the static score is +40 pts (at full confidence),
+and the maximum penalty is -40 pts. An average Epic echo in your primary family
+(80 pts static) that the AI has learned is excellent could score up to 120 pts.
+
+
+HOW THE HOOK WORKS
+-------------------
+The hook is installed once at PLAYER_LOGIN, after ProjectEbonhold has fully
+loaded. It wraps two functions:
+
+  PerkUI.Show(choices)
+    - Runs the original function first (the echo cards always appear normally)
+    - Stores the offered choices in a local variable so the SelectPerk hook
+      knows who the "losers" were
+    - If auto-select is enabled, calls DoAutoSelect(choices) which scores each
+      offered echo and calls SelectPerk on the winner after a configurable
+      delay (default 0.6 seconds) so the player briefly sees what happened
+
+  PerkService.SelectPerk(spellId)
+    - Calls the original function first and captures its return value
+    - If the selection succeeded AND we have stored offered choices:
+        · Identifies the losers (everyone offered but not chosen)
+        · Calls RecordComparison(winner, losers, role) to update ELO
+        · Adds the chosen echo to the current run's tracked build
+    - Returns the original result unchanged
+
+Because SelectPerk is hooked at the service level, it captures both manual
+clicks (player clicks a card) AND automatic picks from DoAutoSelect. The
+learning engine therefore improves regardless of whether auto-select is on.
+
+
+SAVED VARIABLES
+----------------
+Two SavedVariable tables are written to disk when you log out:
+
+  EchoBuddyDB       - User settings:
+                        autoSelect    (bool)   - whether auto-pick is enabled
+                        selectedRole  (string) - last chosen role
+                        notifyChat    (bool)   - whether to print chat messages
+                        selectDelay   (number) - seconds before auto-pick fires
+                        useAIScores   (bool)   - whether to blend AI into scores
+
+  EchoBuddyLearnDB  - AI model data:
+                        [role][spellId] = { elo, comparisons, wins, losses,
+                                            runCount, runLevelAvg, lastSeen }
+                        One entry per (role, echo) pair, persists forever
+                        until manually reset with /ebreset.
+
+
+SLASH COMMANDS
+---------------
+  /eb  or  /echobuild       Open / close the main window
+  /ebauto                   Toggle auto-select on/off from anywhere
+  /ebstats                  Print AI learning stats for all roles to chat
+  /ebreset [role]           Wipe AI data for one role, or all roles if no
+                            argument is given (e.g.  /ebreset tank)
+
+
+THE ADVISOR WINDOW  (opened with /eb)
+--------------------------------------
+  Auto-Select panel (top half):
+    Enable checkbox       - turns auto-select on or off
+    Chat msg checkbox     - controls whether a chat line is printed on pick
+    Use AI scores         - whether to blend the learned model into scoring
+    Role dropdown         - sets the role for BOTH auto-select and the advisor
+    Status line           - shows whether auto-select is active and for which role
+
+  Build Advisor panel (bottom half):
+    Class dropdown        - filter echoes by class
+    Role dropdown         - (synced with the auto-select role above)
+    Use My Character      - auto-detects your logged-in character's class
+    Recommend Echoes      - runs the scoring algorithm and fills the list
+    Reset AI Data         - wipes AI learning for the selected role (with confirm)
+    Scroll list           - up to 50 echoes ranked by score, showing:
+                              rank · icon · name (quality colour) · quality ·
+                              families · confidence dot · score
+    Hover tooltip         - full spell tooltip plus score breakdown:
+                              Score: 74  (Base 50  ELO+18  Run+6  Conf 87%)
+                              and raw AI data: wins/losses, runs, avg level, ELO
+    AI stats bar          - shows how much data the model has for the current role
+
+  Confidence dot legend:
+    ⚫ Grey    < 3 comparisons  - no data, static scoring only
+    🟡 Yellow  3–9              - early learning, treat with caution
+    🟠 Orange  10–29            - building confidence
+    🟢 Green   30+              - AI is confident, scores are reliable
+
+
+WHY EACH DESIGN DECISION WAS MADE
+-----------------------------------
+ELO over win-rate ratio:
+  A simple win-rate (wins / total_offered) would be biased by which other
+  echoes happened to be offered alongside. ELO accounts for opponent strength:
+  beating a high-rated echo is worth more than beating a low-rated one.
+
+Run EMA over run average:
+  A simple mean would weigh your first run at level 5 equally with your latest
+  run at level 60. EMA gives recent runs more influence, which is important
+  as your skill improves and as the server updates the balance.
+
+Confidence blending over hard switching:
+  Switching abruptly from "all static" to "all AI" at some threshold would
+  cause jarring recommendation changes. A smooth blend means the model
+  gradually takes over as evidence accumulates, with no sudden jump.
+
+UCB1 over pure exploitation:
+  Without an exploration term, rare echoes that happen to be offered early
+  and lose once would be rated poorly forever. UCB1 ensures the model stays
+  curious and continues to refine its understanding of rarely-seen echoes.
+
+Hooking PerkUI.Show rather than registering a new server event handler:
+  ProjectEbonhold's onEventReceived() replaces handlers (it is not additive),
+  so registering our own handler for SEND_PLAYER_PERK_CHOICE would break the
+  original UI entirely. Wrapping PerkUI.Show is fully non-destructive: the
+  original function always runs first and our code runs alongside it.
+
+Wrapping PerkService.SelectPerk at the service level:
+  This captures both manual and automatic picks from a single hook point,
+  so the learning engine trains on everything regardless of whether
+  auto-select is enabled.
+
+
+FILE STRUCTURE
+---------------
+  EbonholdEchoBuddy/
+  ├── EbonholdEchoBuddy.toc    WoW addon manifest, declares dependencies
+  │                             and SavedVariables
+  ├── EbonholdEchoBuddy.lua    All addon code in one file, 12 sections:
+  │                               1.  Constants
+  │                               2.  Static scoring weights
+  │                               3.  SavedVariables helpers
+  │                               4.  Learning engine
+  │                                     GetLearnData, RecordComparison,
+  │                                     RecordRunOutcome, BlendedScore,
+  │                                     LearnStats, ResetLearnData
+  │                               5.  Run tracking state
+  │                               6.  Auto-select engine + toast
+  │                               7.  Hook installation
+  │                               8.  Death / run-end event frame
+  │                               9.  Database scoring (static + AI blend)
+  │                               10. GUI (advisor window)
+  │                               11. Slash commands
+  │                               12. Initialisation (ADDON_LOADED, PLAYER_LOGIN)
+  └── SUMMARY.txt              This file
+
+================================================================================
