@@ -133,4 +133,4 @@ Role primary bonus: +40 | Secondary bonus: +5 to +20 depending on role
 
 ## Author
 
-**Ebonhold** — built for the Valanior / Project Ebonhold community.
+**Nu/Veronica** — built for the Valanior / Project Ebonhold community.
