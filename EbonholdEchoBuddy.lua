@@ -92,10 +92,32 @@ local function GetDB()
     for k,v in pairs(DB_DEFAULTS) do
         if EchoBuddyDB[k] == nil then EchoBuddyDB[k] = v end
     end
+    -- Blacklist stored separately so the table reference is never shared with DB_DEFAULTS
+    if EchoBuddyDB.blacklist == nil then EchoBuddyDB.blacklist = {} end
     return EchoBuddyDB
 end
 local function SaveRole(r)    GetDB().selectedRole = r end
 local function SaveAuto(v)    GetDB().autoSelect   = v end
+
+-- Blacklist helpers (global — applies across all roles)
+local function IsBlacklisted(spellId)
+    return GetDB().blacklist[spellId] == true
+end
+local function ToggleBlacklist(spellId)
+    local bl = GetDB().blacklist
+    if bl[spellId] then
+        bl[spellId] = nil
+        return false   -- removed
+    else
+        bl[spellId] = true
+        return true    -- added
+    end
+end
+local function BlacklistCount()
+    local n = 0
+    for _ in pairs(GetDB().blacklist) do n = n + 1 end
+    return n
+end
 
 -------------------------------------------------------------------------------
 -- 4. LEARNING ENGINE
@@ -338,14 +360,16 @@ local function DoAutoSelect(choices)
     local best = {spellId=nil, score=-math.huge, name="", quality=0}
 
     for _, choice in ipairs(choices) do
-        local perkDB = ProjectEbonhold and ProjectEbonhold.PerkDatabase
-        local quality = choice.quality or (perkDB and perkDB[choice.spellId] and perkDB[choice.spellId].quality) or 0
-        local score   = (BlendedScore(choice.spellId, quality, config, role))
-        if score > best.score then
-            best.spellId = choice.spellId
-            best.score   = score
-            best.name    = GetSpellInfo(choice.spellId) or ("Echo #"..choice.spellId)
-            best.quality = quality
+        if not IsBlacklisted(choice.spellId) then
+            local perkDB  = ProjectEbonhold and ProjectEbonhold.PerkDatabase
+            local quality = choice.quality or (perkDB and perkDB[choice.spellId] and perkDB[choice.spellId].quality) or 0
+            local score   = (BlendedScore(choice.spellId, quality, config, role))
+            if score > best.score then
+                best.spellId = choice.spellId
+                best.score   = score
+                best.name    = GetSpellInfo(choice.spellId) or ("Echo #" .. choice.spellId)
+                best.quality = quality
+            end
         end
     end
 
@@ -495,19 +519,22 @@ local function ScoreFullDatabase(classMask, role)
         local final, base, eloAdj, runAdj, conf, confLevel =
             BlendedScore(e.spellId, e.perk.quality, config, role)
         table.insert(scored, {
-            spellId  = e.spellId,
-            perk     = e.perk,
-            score    = final,
-            base     = base,
-            eloAdj   = eloAdj,
-            runAdj   = runAdj,
-            conf     = conf,
-            confLevel= confLevel,
+            spellId    = e.spellId,
+            perk       = e.perk,
+            score      = final,
+            base       = base,
+            eloAdj     = eloAdj,
+            runAdj     = runAdj,
+            conf       = conf,
+            confLevel  = confLevel,
+            blacklisted= IsBlacklisted(e.spellId),
         })
     end
 
     table.sort(scored, function(a, b)
-        if a.score ~= b.score       then return a.score > b.score end
+        -- Blacklisted entries always sink to the bottom
+        if a.blacklisted ~= b.blacklisted then return not a.blacklisted end
+        if a.score ~= b.score             then return a.score > b.score end
         if a.perk.quality ~= b.perk.quality then return a.perk.quality > b.perk.quality end
         return (GetSpellInfo(a.spellId) or "") < (GetSpellInfo(b.spellId) or "")
     end)
@@ -597,16 +624,48 @@ local function GetOrCreateRow(index)
             if self._families and #self._families > 0 then
                 GameTooltip:AddLine("|cff888888" .. table.concat(self._families, "  •  ") .. "|r")
             end
+            local blHint = IsBlacklisted(self._spellId)
+                and "|cff44FF44Right-click to remove from blacklist|r"
+                 or "|cffAA3333Right-click to blacklist this echo|r"
+            GameTooltip:AddLine(" ")
+            GameTooltip:AddLine(blHint)
             GameTooltip:Show()
         end
     end)
     row:SetScript("OnLeave", function(self)
-        if self._isEven then
+        if self._blacklisted then
+            self._bg:SetTexture(0.16, 0.03, 0.03, 0.55)
+        elseif self._isEven then
             self._bg:SetTexture(0.06, 0.04, 0.18, 0.45)
         else
             self._bg:SetTexture(0, 0, 0, 0)
         end
         GameTooltip:Hide()
+    end)
+
+    -- Right-click to toggle blacklist
+    row:SetScript("OnMouseUp", function(self, button)
+        if button ~= "RightButton" or not self._spellId then return end
+        local sid  = self._spellId
+        local name = GetSpellInfo(sid) or ("Echo #" .. sid)
+        local isbl = IsBlacklisted(sid)
+        if not _G["EBBContextMenu"] then
+            CreateFrame("Frame", "EBBContextMenu", UIParent, "UIDropDownMenuTemplate")
+        end
+        local menuList = {
+            {text = name, isTitle = true, notCheckable = true},
+            {
+                text         = isbl and "|cff44FF44Remove from Blacklist|r"
+                                     or "|cffFF5555Add to Blacklist|r",
+                notCheckable = true,
+                func         = function()
+                    ToggleBlacklist(sid)
+                    RunRecommendation()
+                end,
+            },
+            {text = "Cancel", notCheckable = true, func = function() end},
+        }
+        EasyMenu(menuList, _G["EBBContextMenu"], "cursor", 0, 0, "MENU")
     end)
 
     resultRows[index] = row
@@ -628,31 +687,49 @@ local function DisplayResults(results, className, role)
         local qc      =QUALITY_COLOR[quality] or QUALITY_COLOR[0]
         local isEven  =(i%2==0)
 
-        local row=GetOrCreateRow(i)
-        row:SetPoint("TOPLEFT",scrollChild,"TOPLEFT",0,-(i-1)*ROW_H)
-        row._spellId =e.spellId
-        row._quality =quality
-        row._scoreVal=e.score
-        row._base    =e.base
-        row._eloAdj  =e.eloAdj
-        row._runAdj  =e.runAdj
-        row._conf    =e.conf
-        row._families=families
-        row._isEven  =isEven
-        row._role    =role
+        local isbl    = e.blacklisted
+        local row     = GetOrCreateRow(i)
+        row:SetPoint("TOPLEFT", scrollChild, "TOPLEFT", 0, -(i - 1) * ROW_H)
+        row._spellId    = e.spellId
+        row._quality    = quality
+        row._scoreVal   = e.score
+        row._base       = e.base
+        row._eloAdj     = e.eloAdj
+        row._runAdj     = e.runAdj
+        row._conf       = e.conf
+        row._families   = families
+        row._isEven     = isEven
+        row._role       = role
+        row._blacklisted= isbl
 
-        if isEven then row._bg:SetTexture(0.06, 0.04, 0.18, 0.45)
-        else           row._bg:SetTexture(0, 0, 0, 0) end
+        if isbl then
+            row._bg:SetTexture(0.16, 0.03, 0.03, 0.55)
+        elseif isEven then
+            row._bg:SetTexture(0.06, 0.04, 0.18, 0.45)
+        else
+            row._bg:SetTexture(0, 0, 0, 0)
+        end
 
-        row._rank:SetText("|cff555577#" .. i .. "|r")
-        row._icon:SetTexture(si)
-        row._name:SetTextColor(qc[1], qc[2], qc[3]); row._name:SetText(sn)
-        row._qual:SetTextColor(qc[1], qc[2], qc[3]); row._qual:SetText(QUALITY_NAME[quality] or "?")
-        row._fam:SetText(table.concat(families, " • "))
-        row._dot:SetText(ConfDot(e.confLevel or 0))
-        local ratio = math.min(1, e.score / 80)
-        row._score:SetTextColor(1 - ratio * 0.5, 0.7 + ratio * 0.3, 0)
-        row._score:SetText(math.floor(e.score))
+        if isbl then
+            row._rank:SetText("|cffAA2222⊘|r")
+            row._icon:SetDesaturated(true)
+            row._name:SetTextColor(0.40, 0.38, 0.38); row._name:SetText(sn)
+            row._qual:SetTextColor(0.40, 0.38, 0.38); row._qual:SetText(QUALITY_NAME[quality] or "?")
+            row._fam:SetTextColor(0.35, 0.33, 0.33);  row._fam:SetText(table.concat(families, " • "))
+            row._dot:SetText("")
+            row._score:SetTextColor(0.38, 0.35, 0.35); row._score:SetText(math.floor(e.score))
+        else
+            row._rank:SetText("|cff555577#" .. i .. "|r")
+            row._icon:SetDesaturated(false)
+            row._name:SetTextColor(qc[1], qc[2], qc[3]); row._name:SetText(sn)
+            row._qual:SetTextColor(qc[1], qc[2], qc[3]); row._qual:SetText(QUALITY_NAME[quality] or "?")
+            row._fam:SetTextColor(0.60, 0.55, 0.75);    row._fam:SetText(table.concat(families, " • "))
+            row._dot:SetText(ConfDot(e.confLevel or 0))
+            local ratio = math.min(1, e.score / 80)
+            row._score:SetTextColor(1 - ratio * 0.5, 0.7 + ratio * 0.3, 0)
+            row._score:SetText(math.floor(e.score))
+        end
+
         row:SetSize(580, ROW_H); row:Show()
     end
 
@@ -660,11 +737,13 @@ local function DisplayResults(results, className, role)
 
     -- Info bar
     if infoText then
-        local ci=CLASS_INTERNAL[selectedClassIdx]
-        local cc=CLASS_COLOR[ci] or {1,1,1}
+        local ci  = CLASS_INTERNAL[selectedClassIdx]
+        local cc  = CLASS_COLOR[ci] or {1, 1, 1}
+        local blc = BlacklistCount()
+        local blStr = blc > 0 and ("  ·  |cffAA2222⊘ " .. blc .. " blacklisted|r") or ""
         infoText:SetText(string.format(
-            "Showing |cffFFD700%d|r echoes  ·  |cff%02x%02x%02x%s|r  |cff888888›|r  |cff00CCFF%s|r",
-            shown,cc[1]*255,cc[2]*255,cc[3]*255,className,role))
+            "Showing |cffFFD700%d|r echoes  ·  |cff%02x%02x%02x%s|r  |cff888888›|r  |cff00CCFF%s|r%s",
+            shown, cc[1]*255, cc[2]*255, cc[3]*255, className, role, blStr))
     end
     -- AI stats bar
     if aiStatsText then
@@ -1107,11 +1186,43 @@ SlashCmdList["ECHOBUILD"]=function(msg)
     local cmd=(msg or ""):lower():match("^%s*(%S*)")
     if cmd=="help" then
         print("|cffFFD700Echo Buddy commands:|r")
-        print("  |cff00CCFF/eb|r               Open / close the window")
-        print("  |cff00CCFF/ebauto|r            Toggle auto-select on/off")
-        print("  |cff00CCFF/ebstats|r           Print AI learning stats to chat")
-        print("  |cff00CCFF/ebreset [role]|r    Wipe AI data for a role (or all)")
+        print("  |cff00CCFF/eb|r                    Open / close the window")
+        print("  |cff00CCFF/ebauto|r                Toggle auto-select on/off")
+        print("  |cff00CCFF/ebstats|r               Print AI learning stats to chat")
+        print("  |cff00CCFF/ebreset [role]|r        Wipe AI data for a role (or all)")
+        print("  |cff00CCFF/ebblacklist|r            List blacklisted echoes")
+        print("  |cff00CCFF/ebblacklist clear|r      Remove all echoes from the blacklist")
     else OpenAddon() end
+end
+
+SLASH_EBBLACKLIST1="/ebblacklist"
+SlashCmdList["EBBLACKLIST"]=function(msg)
+    local arg = (msg or ""):lower():match("^%s*(.-)%s*$")
+    if arg == "clear" then
+        ShowConfirm("Clear the entire blacklist?\nAll echoes will become selectable again.",
+            function()
+                GetDB().blacklist = {}
+                print("|cffFFD700[Echo Buddy]|r Blacklist cleared.")
+                RunRecommendation()
+            end)
+    else
+        local bl = GetDB().blacklist
+        local list = {}
+        for sid in pairs(bl) do
+            local name = GetSpellInfo(sid) or ("Echo #" .. sid)
+            table.insert(list, name)
+        end
+        if #list == 0 then
+            print("|cffFFD700[Echo Buddy]|r Blacklist is empty.")
+        else
+            table.sort(list)
+            print("|cffFFD700[Echo Buddy]|r Blacklisted echoes (" .. #list .. "):")
+            for _, name in ipairs(list) do
+                print("  |cffAA2222⊘|r " .. name)
+            end
+            print("|cff888888Use /ebblacklist clear to remove all, or right-click an echo in the window.|r")
+        end
+    end
 end
 
 SLASH_EBAUTO1="/ebauto"
