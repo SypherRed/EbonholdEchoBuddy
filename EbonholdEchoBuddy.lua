@@ -551,6 +551,17 @@ local scrollChild    = nil
 local infoText       = nil
 local aiStatsText    = nil
 local autoCheckbox   = nil
+local blBtn          = nil   -- blacklist button (shows count)
+
+-- Blacklist frame state
+local blFrame        = nil
+local blSearchRows   = {}
+local blListRows     = {}
+local blSearchChild  = nil
+local blListChild    = nil
+local blSearchQuery  = ""
+local blResultLabel  = nil
+local blListLabel    = nil
 
 local selectedClassIdx = 1
 local selectedRoleIdx  = 1
@@ -735,15 +746,18 @@ local function DisplayResults(results, className, role)
 
     scrollChild:SetHeight(math.max(1,shown*ROW_H))
 
-    -- Info bar
+    -- Info bar + blacklist button count
+    local blc = BlacklistCount()
     if infoText then
-        local ci  = CLASS_INTERNAL[selectedClassIdx]
-        local cc  = CLASS_COLOR[ci] or {1, 1, 1}
-        local blc = BlacklistCount()
+        local ci    = CLASS_INTERNAL[selectedClassIdx]
+        local cc    = CLASS_COLOR[ci] or {1, 1, 1}
         local blStr = blc > 0 and ("  ·  |cffAA2222⊘ " .. blc .. " blacklisted|r") or ""
         infoText:SetText(string.format(
             "Showing |cffFFD700%d|r echoes  ·  |cff%02x%02x%02x%s|r  |cff888888›|r  |cff00CCFF%s|r%s",
             shown, cc[1]*255, cc[2]*255, cc[3]*255, className, role, blStr))
+    end
+    if blBtn then
+        blBtn:SetText(blc > 0 and ("⊘ Blacklist (" .. blc .. ")") or "⊘ Blacklist")
     end
     -- AI stats bar
     if aiStatsText then
@@ -832,6 +846,311 @@ local function ShowConfirm(msg, onYes)
         hideOnEscape = true,
     }
     StaticPopup_Show("EBB_CONFIRM")
+end
+
+-- ── Blacklist frame helpers ───────────────────────────────────────────────────
+
+local function SearchEchoes(query)
+    if not query or #query < 2 then return {} end
+    query = query:lower()
+    local perkDB = ProjectEbonhold and ProjectEbonhold.PerkDatabase
+    if not perkDB then return {} end
+    local out = {}
+    for spellId, perk in pairs(perkDB) do
+        local name = GetSpellInfo(spellId)
+        if name and name:lower():find(query, 1, true) then
+            table.insert(out, {spellId=spellId, name=name, quality=perk.quality or 0})
+            if #out >= 20 then break end
+        end
+    end
+    table.sort(out, function(a, b) return a.name < b.name end)
+    return out
+end
+
+-- Shared row builder for both search-result and blacklist-entry scroll lists
+local function GetOrCreateBlRow(parent, cache, index, rowW)
+    if cache[index] then return cache[index] end
+    local row = CreateFrame("Frame", nil, parent)
+    row:SetSize(rowW, 22)
+    local bg = row:CreateTexture(nil, "BACKGROUND"); bg:SetAllPoints(); row._bg = bg
+    local lbl = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    lbl:SetPoint("LEFT", row, "LEFT", 6, 0); lbl:SetSize(rowW - 108, 22)
+    lbl:SetJustifyH("LEFT"); row._lbl = lbl
+    local btn = CreateFrame("Button", nil, row, "GameMenuButtonTemplate")
+    btn:SetSize(92, 18); btn:SetPoint("RIGHT", row, "RIGHT", -4, 0); row._btn = btn
+    cache[index] = row
+    return row
+end
+
+local function RefreshBlCount()
+    local n = BlacklistCount()
+    if blBtn then
+        blBtn:SetText(n > 0 and ("⊘ Blacklist (" .. n .. ")") or "⊘ Blacklist")
+    end
+    if blListLabel then
+        blListLabel:SetText("|cffAA8833Currently Blacklisted|r |cff666666(" .. n .. ")|r")
+    end
+end
+
+local function RefreshBlListRows()
+    local bl      = GetDB().blacklist
+    local entries = {}
+    for sid in pairs(bl) do
+        local name = GetSpellInfo(sid) or ("Echo #" .. sid)
+        table.insert(entries, {spellId=sid, name=name})
+    end
+    table.sort(entries, function(a, b) return a.name < b.name end)
+    for i = #entries + 1, #blListRows do
+        if blListRows[i] then blListRows[i]:Hide() end
+    end
+    local rowW = (blListChild and blListChild:GetWidth() > 10 and blListChild:GetWidth()) or 374
+    for i, e in ipairs(entries) do
+        local row = GetOrCreateBlRow(blListChild, blListRows, i, rowW)
+        row:SetPoint("TOPLEFT", blListChild, "TOPLEFT", 0, -(i - 1) * 22)
+        row._bg:SetTexture(i % 2 == 0 and 0.16 or 0.12, 0.03, 0.03,
+                           i % 2 == 0 and 0.55 or 0.45)
+        row._lbl:SetTextColor(0.80, 0.36, 0.36)
+        row._lbl:SetText("|cffAA2222⊘|r " .. e.name)
+        row._btn:SetText("Remove")
+        local sid = e.spellId
+        row._btn:SetScript("OnClick", function()
+            ToggleBlacklist(sid)
+            RefreshBlListRows()
+            RefreshBlCount()
+            -- re-run search so the removed echo updates there too
+            local sq = blSearchQuery
+            if #sq >= 2 then
+                -- trigger re-render of search results
+                local perkDB = ProjectEbonhold and ProjectEbonhold.PerkDatabase
+                if perkDB then
+                    -- RefreshBlSearchResults is defined below; call via upvalue
+                    RefreshBlSearchResults(sq)
+                end
+            end
+            RunRecommendation()
+        end)
+        row:SetSize(rowW, 22); row:Show()
+    end
+    blListChild:SetHeight(math.max(1, #entries * 22))
+    RefreshBlCount()
+end
+
+-- Forward-declared local so RefreshBlListRows rows can close over it before it is defined
+local RefreshBlSearchResults
+RefreshBlSearchResults = function(query)
+    blSearchQuery = query or ""
+    local results = SearchEchoes(query)
+    for i = #results + 1, #blSearchRows do
+        if blSearchRows[i] then blSearchRows[i]:Hide() end
+    end
+    local rowW = (blSearchChild and blSearchChild:GetWidth() > 10 and blSearchChild:GetWidth()) or 374
+    for i, e in ipairs(results) do
+        local row  = GetOrCreateBlRow(blSearchChild, blSearchRows, i, rowW)
+        row:SetPoint("TOPLEFT", blSearchChild, "TOPLEFT", 0, -(i - 1) * 22)
+        local isbl = IsBlacklisted(e.spellId)
+        local qc   = QUALITY_COLOR[e.quality] or QUALITY_COLOR[0]
+        local qn   = QUALITY_NAME[e.quality]  or "?"
+        row._bg:SetTexture(i % 2 == 0 and 0.06 or 0, i % 2 == 0 and 0.04 or 0,
+                           i % 2 == 0 and 0.16 or 0, i % 2 == 0 and 0.40 or 0)
+        if isbl then
+            row._lbl:SetTextColor(0.40, 0.36, 0.36)
+            row._lbl:SetText("|cffAA2222⊘|r " .. e.name .. " |cff555555(" .. qn .. ")|r")
+            row._btn:SetText("Remove")
+        else
+            row._lbl:SetTextColor(qc[1], qc[2], qc[3])
+            row._lbl:SetText(e.name .. " |cff665599(" .. qn .. ")|r")
+            row._btn:SetText("+ Blacklist")
+        end
+        local sid = e.spellId
+        row._btn:SetScript("OnClick", function()
+            ToggleBlacklist(sid)
+            RefreshBlSearchResults(blSearchQuery)
+            RefreshBlListRows()
+            RunRecommendation()
+        end)
+        row:SetSize(rowW, 22); row:Show()
+    end
+    blSearchChild:SetHeight(math.max(1, #results * 22))
+    if blResultLabel then
+        blResultLabel:SetText(
+            #results > 0
+            and ("|cffAA8833Search Results|r |cff666666(" .. #results .. ")|r")
+             or "|cff665599Search Results|r |cff444444— type 2 or more characters|r")
+    end
+end
+
+local function BuildBlacklistFrame()
+    local BW, BH = 440, 440
+
+    blFrame = CreateFrame("Frame", "EBBBlacklistFrame", UIParent)
+    blFrame:SetSize(BW, BH)
+    blFrame:SetPoint("LEFT", mainFrame, "RIGHT", 8, 20)
+    blFrame:SetMovable(true)
+    blFrame:EnableMouse(true)
+    blFrame:RegisterForDrag("LeftButton")
+    blFrame:SetScript("OnDragStart", blFrame.StartMoving)
+    blFrame:SetScript("OnDragStop",  blFrame.StopMovingOrSizing)
+    blFrame:SetFrameStrata("HIGH")
+    blFrame:SetBackdrop({
+        bgFile   = "Interface\\DialogFrame\\UI-DialogBox-Background",
+        edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+        tile=true, tileSize=32, edgeSize=32,
+        insets={left=11, right=12, top=12, bottom=11},
+    })
+    blFrame:SetBackdropColor(0.03, 0.02, 0.12, 0.98)
+    blFrame:SetBackdropBorderColor(0.40, 0.25, 0.70, 1.0)
+
+    -- Header gradient band
+    local hdrBand = blFrame:CreateTexture(nil, "BORDER")
+    hdrBand:SetTexture("Interface\\Buttons\\WHITE8X8")
+    hdrBand:SetPoint("TOPLEFT",  blFrame, "TOPLEFT",  12, -12)
+    hdrBand:SetPoint("TOPRIGHT", blFrame, "TOPRIGHT", -12, -12)
+    hdrBand:SetHeight(46)
+    hdrBand:SetGradientAlpha("VERTICAL", 0.14, 0.08, 0.36, 0.95, 0.03, 0.02, 0.12, 0)
+
+    local title = blFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlightLarge")
+    title:SetPoint("TOP", blFrame, "TOP", 0, -18)
+    title:SetText("|cffFFD700Blacklist Manager|r")
+
+    local closeBtn = CreateFrame("Button", nil, blFrame, "UIPanelCloseButton")
+    closeBtn:SetPoint("TOPRIGHT", blFrame, "TOPRIGHT", -4, -4)
+    closeBtn:SetScript("OnClick", function() blFrame:Hide() end)
+
+    -- Gold accent line under header
+    local hdrLine = blFrame:CreateTexture(nil, "ARTWORK")
+    hdrLine:SetTexture("Interface\\Buttons\\WHITE8X8")
+    hdrLine:SetPoint("TOPLEFT",  blFrame, "TOPLEFT",  15, -56)
+    hdrLine:SetPoint("TOPRIGHT", blFrame, "TOPRIGHT", -15, -56)
+    hdrLine:SetHeight(1)
+    hdrLine:SetVertexColor(0.88, 0.72, 0.18, 1.0)
+    local hdrGlow = blFrame:CreateTexture(nil, "ARTWORK")
+    hdrGlow:SetTexture("Interface\\Buttons\\WHITE8X8")
+    hdrGlow:SetPoint("TOPLEFT",  blFrame, "TOPLEFT",  15, -57)
+    hdrGlow:SetPoint("TOPRIGHT", blFrame, "TOPRIGHT", -15, -57)
+    hdrGlow:SetHeight(6)
+    hdrGlow:SetGradientAlpha("VERTICAL", 0.88, 0.72, 0.18, 0.20, 0.88, 0.72, 0.18, 0)
+    hdrGlow:SetBlendMode("ADD")
+
+    -- Shared helpers
+    local function GD(yOff)
+        local line = blFrame:CreateTexture(nil, "ARTWORK")
+        line:SetTexture("Interface\\Buttons\\WHITE8X8")
+        line:SetPoint("TOPLEFT",  blFrame, "TOPLEFT",  15, yOff)
+        line:SetPoint("TOPRIGHT", blFrame, "TOPRIGHT", -15, yOff)
+        line:SetHeight(1)
+        line:SetVertexColor(0.88, 0.72, 0.18, 0.65)
+        local glow = blFrame:CreateTexture(nil, "ARTWORK")
+        glow:SetTexture("Interface\\Buttons\\WHITE8X8")
+        glow:SetPoint("TOPLEFT",  blFrame, "TOPLEFT",  15, yOff - 1)
+        glow:SetPoint("TOPRIGHT", blFrame, "TOPRIGHT", -15, yOff - 1)
+        glow:SetHeight(5)
+        glow:SetGradientAlpha("VERTICAL", 0.88, 0.72, 0.18, 0.16, 0.88, 0.72, 0.18, 0)
+        glow:SetBlendMode("ADD")
+    end
+
+    local function SP(yTop, h)
+        local p = CreateFrame("Frame", nil, blFrame)
+        p:SetPoint("TOPLEFT",  blFrame, "TOPLEFT",  14, yTop)
+        p:SetPoint("TOPRIGHT", blFrame, "TOPRIGHT", -14, yTop)
+        p:SetHeight(h)
+        p:SetBackdrop({
+            bgFile="Interface\\Tooltips\\UI-Tooltip-Background",
+            edgeFile="Interface\\Tooltips\\UI-Tooltip-Border",
+            tile=true, tileSize=16, edgeSize=12,
+            insets={left=3, right=3, top=3, bottom=3},
+        })
+        p:SetBackdropColor(0.07, 0.04, 0.20, 0.50)
+        p:SetBackdropBorderColor(0.38, 0.26, 0.62, 0.45)
+        return p
+    end
+
+    ---------------------------------------------------------------------------
+    -- SEARCH SECTION
+    ---------------------------------------------------------------------------
+    SP(-60, 58)
+
+    local srchLbl = blFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    srchLbl:SetPoint("TOPLEFT", blFrame, "TOPLEFT", 24, -73)
+    srchLbl:SetTextColor(0.65, 0.50, 0.90)
+    srchLbl:SetText("Echo name:")
+
+    local searchBox = CreateFrame("EditBox", "EBBBlSearchBox", blFrame, "InputBoxTemplate")
+    searchBox:SetSize(220, 20)
+    searchBox:SetPoint("TOPLEFT", blFrame, "TOPLEFT", 106, -71)
+    searchBox:SetAutoFocus(false)
+    searchBox:SetMaxLetters(60)
+    searchBox:SetScript("OnTextChanged", function(self, userInput)
+        if userInput then RefreshBlSearchResults(self:GetText()) end
+    end)
+    searchBox:SetScript("OnEnterPressed", function(self)
+        RefreshBlSearchResults(self:GetText()); self:ClearFocus()
+    end)
+    searchBox:SetScript("OnEscapePressed", function(self)
+        self:SetText(""); self:ClearFocus(); RefreshBlSearchResults("")
+    end)
+
+    local clearBtn = CreateFrame("Button", nil, blFrame, "UIPanelButtonTemplate")
+    clearBtn:SetSize(48, 20)
+    clearBtn:SetPoint("LEFT", searchBox, "RIGHT", 4, 0)
+    clearBtn:SetText("Clear")
+    clearBtn:SetScript("OnClick", function()
+        searchBox:SetText(""); searchBox:ClearFocus(); RefreshBlSearchResults("")
+    end)
+
+    local hintLbl = blFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    hintLbl:SetPoint("TOPLEFT", blFrame, "TOPLEFT", 24, -96)
+    hintLbl:SetTextColor(0.38, 0.32, 0.52)
+    hintLbl:SetText("Type 2+ characters · or right-click any echo in the main list")
+
+    GD(-122)
+
+    ---------------------------------------------------------------------------
+    -- SEARCH RESULTS
+    ---------------------------------------------------------------------------
+    blResultLabel = blFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    blResultLabel:SetPoint("TOPLEFT", blFrame, "TOPLEFT", 20, -132)
+    blResultLabel:SetText("|cff665599Search Results|r |cff444444— type 2 or more characters|r")
+
+    local srchSF = CreateFrame("ScrollFrame", "EBBBlSearchSF", blFrame, "UIPanelScrollFrameTemplate")
+    srchSF:SetPoint("TOPLEFT",     blFrame, "TOPLEFT",  16, -146)
+    srchSF:SetPoint("TOPRIGHT",    blFrame, "TOPRIGHT", -34, -146)
+    srchSF:SetHeight(112)
+    blSearchChild = CreateFrame("Frame", "EBBBlSearchChild", srchSF)
+    blSearchChild:SetSize(374, 1)
+    srchSF:SetScrollChild(blSearchChild)
+
+    GD(-264)
+
+    ---------------------------------------------------------------------------
+    -- BLACKLIST ENTRIES
+    ---------------------------------------------------------------------------
+    blListLabel = blFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    blListLabel:SetPoint("TOPLEFT", blFrame, "TOPLEFT", 20, -274)
+    blListLabel:SetText("|cffAA8833Currently Blacklisted|r |cff666666(0)|r")
+
+    local clearAllBtn = CreateFrame("Button", nil, blFrame, "GameMenuButtonTemplate")
+    clearAllBtn:SetSize(94, 20)
+    clearAllBtn:SetPoint("TOPRIGHT", blFrame, "TOPRIGHT", -18, -272)
+    clearAllBtn:SetText("Clear All")
+    clearAllBtn:SetScript("OnClick", function()
+        ShowConfirm("Clear the entire blacklist?\nAll echoes will become available again.",
+            function()
+                GetDB().blacklist = {}
+                RefreshBlListRows()
+                RefreshBlSearchResults(blSearchQuery)
+                RunRecommendation()
+            end)
+    end)
+
+    local listSF = CreateFrame("ScrollFrame", "EBBBlListSF", blFrame, "UIPanelScrollFrameTemplate")
+    listSF:SetPoint("TOPLEFT",     blFrame, "TOPLEFT",  16, -290)
+    listSF:SetPoint("BOTTOMRIGHT", blFrame, "BOTTOMRIGHT", -34, 14)
+    blListChild = CreateFrame("Frame", "EBBBlListChild", listSF)
+    blListChild:SetSize(374, 1)
+    listSF:SetScrollChild(blListChild)
+
+    RefreshBlListRows()
+    blFrame:Show()
 end
 
 -- ── Build the main frame ──────────────────────────────────────────────────────
@@ -1076,6 +1395,22 @@ local function BuildMainFrame()
             end
         end
     end)
+
+    -- Blacklist Manager button (opens/closes the popup)
+    blBtn = CreateFrame("Button", nil, mainFrame, "GameMenuButtonTemplate")
+    blBtn:SetSize(148, 24)
+    blBtn:SetPoint("TOPLEFT", mainFrame, "TOPLEFT", 20, -191)
+    blBtn:SetText("⊘ Blacklist")
+    blBtn:SetScript("OnClick", function()
+        if not blFrame then BuildBlacklistFrame() return end
+        if blFrame:IsShown() then blFrame:Hide() else blFrame:Show() end
+    end)
+    blBtn:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_BOTTOM")
+        GameTooltip:SetText("Open the Blacklist Manager.\nBlacklisted echoes are excluded from\nauto-select and ranked at the bottom.", nil, nil, nil, nil, true)
+        GameTooltip:Show()
+    end)
+    blBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
     -- Recommend button
     local recBtn = CreateFrame("Button", nil, mainFrame, "GameMenuButtonTemplate")
